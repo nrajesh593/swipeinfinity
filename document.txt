@@ -1,0 +1,271 @@
+# Secure Multi‑VPS Architecture Guide
+
+This document describes a **production‑grade, repeatable setup** for running **Django microservices** on one VPS while securely connecting to **PostgreSQL, Redis, and Elasticsearch**, each hosted on **separate VPS instances**, using **SSH tunnels only** (no public service ports).
+
+The design ensures:
+
+* No database/cache/search ports exposed to the internet
+* Access only via SSH keys
+* Least‑privilege users
+* Clear separation of concerns
+* Easy recovery and repeatability
+
+---
+
+## 1. High‑Level Architecture
+
+```
+┌──────────────────┐
+│   Your Laptop    │
+│ (SSH + pgAdmin)  │
+└───────┬──────────┘
+        │ SSH (keys only)
+        ▼
+┌──────────────────────────┐
+│        Django VPS        │
+│  - Docker + services     │
+│  - autossh tunnels       │
+│                          │
+│  localhost:5433 → PG     │
+│  localhost:6380 → Redis  │
+│  localhost:9201 → ES     │
+└───────┬─────────┬────────┘
+        │         │
+        │ SSH     │ SSH
+        ▼         ▼
+┌────────────┐  ┌────────────┐  ┌────────────────┐
+│  DB VPS    │  │ Redis VPS  │  │ Elasticsearch  │
+│ Postgres   │  │ Redis      │  │ VPS            │
+│ 127.0.0.1  │  │ 127.0.0.1  │  │ 127.0.0.1      │
+└────────────┘  └────────────┘  └────────────────┘
+```
+
+---
+
+## 2. Common Security Principles (All VPS)
+
+### Users
+
+* `root`: **NO SSH login**
+* `cnr`: primary admin (SSH key + sudo)
+* One tunnel user per service:
+
+  * `dbtunnel`
+  * `redistunnel`
+  * `estunnel`
+
+### SSH Hardening (All VPS)
+
+`/etc/ssh/sshd_config` (or included drop‑ins):
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AllowUsers cnr <tunnel-user>
+```
+
+### Firewall (UFW)
+
+```
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow OpenSSH
+ufw enable
+```
+
+**Never open service ports** (5432, 6379, 9200).
+
+---
+
+## 3. PostgreSQL VPS
+
+### Service Configuration
+
+* Installed directly on host (no Docker)
+* Bound to localhost only
+
+`postgresql.conf`
+
+```
+listen_addresses = '127.0.0.1'
+```
+
+`pg_hba.conf`
+
+```
+local   all   all                  scram-sha-256
+host    all   all 127.0.0.1/32     scram-sha-256
+```
+
+### Roles
+
+* `postgres`: local superuser only
+* `myapp_user`: application role (per DB)
+
+### Tunnel User Lockdown
+
+* Shell: `/usr/sbin/nologin`
+* `authorized_keys`:
+
+```
+no-agent-forwarding,no-X11-forwarding,no-pty,permitopen="127.0.0.1:5432" ssh-ed25519 AAAA...
+```
+
+---
+
+## 4. Redis VPS
+
+### Redis Configuration
+
+`/etc/redis/redis.conf`
+
+```
+bind 127.0.0.1 ::1
+protected-mode yes
+requirepass <STRONG_PASSWORD>
+```
+
+### Tunnel User Lockdown
+
+```
+permitopen="127.0.0.1:6379"
+```
+
+---
+
+## 5. Elasticsearch VPS
+
+### Elasticsearch Configuration
+
+`/etc/elasticsearch/elasticsearch.yml`
+
+```
+network.host: 127.0.0.1
+http.port: 9200
+```
+
+### Tunnel User Lockdown
+
+```
+permitopen="127.0.0.1:9200"
+```
+
+---
+
+## 6. Django VPS
+
+### Docker
+
+* Docker Engine + docker‑compose
+* All microservices run in containers
+
+### SSH Tunnel Keys
+
+```
+~/.ssh/db_tunnel_ed25519
+~/.ssh/redis_tunnel_ed25519
+~/.ssh/es_tunnel_ed25519
+```
+
+### autossh Systemd Services
+
+#### PostgreSQL Tunnel
+
+* Local: `5433 → DB 5432`
+
+#### Redis Tunnel
+
+* Local: `6380 → Redis 6379`
+
+#### Elasticsearch Tunnel
+
+* Local: `9201 → ES 9200`
+
+All services:
+
+* Restart automatically
+* Start after network is online
+
+---
+
+## 7. Docker → Host Connectivity
+
+In `docker-compose.yml`:
+
+```
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+### Django Service Endpoints
+
+| Service       | Host                 | Port |
+| ------------- | -------------------- | ---- |
+| PostgreSQL    | host.docker.internal | 5433 |
+| Redis         | host.docker.internal | 6380 |
+| Elasticsearch | host.docker.internal | 9201 |
+
+---
+
+## 8. Admin & Operations
+
+### OS Root Access
+
+```
+ssh cnr@VPS_IP
+sudo -i
+```
+
+### Postgres Superuser
+
+```
+sudo -u postgres psql
+```
+
+### pgAdmin / Local Access
+
+Use SSH tunnel:
+
+```
+ssh -N -L 5433:127.0.0.1:5432 cnr@DB_VPS
+```
+
+Then connect pgAdmin to `localhost:5433`.
+
+---
+
+## 9. Why This Design Is Secure
+
+* No public DB/cache/search ports
+* SSH keys only
+* Least‑privilege roles
+* Compartmentalized VPS
+* Stolen key = limited blast radius
+* Production‑proven pattern
+
+---
+
+## 10. Recommended Add‑Ons (Future)
+
+* Encrypted off‑site backups
+* Fail2ban
+* Monitoring (disk, memory)
+* Per‑service DB users
+* pgBouncer for Postgres
+* Redis ACL users
+* Elasticsearch API keys
+
+---
+
+## 11. Golden Rules
+
+* ❌ Never expose service ports publicly
+* ❌ Never use root over SSH
+* ❌ Never use Postgres superuser in apps
+* ✅ Always use tunnels or VPN
+* ✅ Always use least privilege
+
+---
+
+**This document can be reused as a standard blueprint for future infrastructure.**
